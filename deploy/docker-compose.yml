@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: aira-postgres
+    environment:
+      POSTGRES_DB: aira
+      POSTGRES_USER: aira
+      POSTGRES_PASSWORD: aira
+    ports:
+      - "5432:5432"
+    volumes:
+      - aira_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aira -d aira"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  aira_pgdata:
