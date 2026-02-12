@@ -3,7 +3,7 @@ use axum::{
     http::Request,
     middleware,
 
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, put},
@@ -18,7 +18,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use async_trait::async_trait;
@@ -45,16 +45,20 @@ async fn main() {
     };
 
     let api_key = env::var("AIRA_API_KEY").ok().filter(|v| !v.trim().is_empty());
-    let allow_insecure_dev = env::var("AIRA_ALLOW_INSECURE_DEV")
+    let auth_disabled = env::var("AIRA_AUTH_DISABLED")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
     if api_key.is_none() {
-        if allow_insecure_dev {
-            info!(event = "auth.init", mode = "disabled", "API key auth disabled (dev mode)");
+        if auth_disabled {
+            warn!(event = "auth.init", mode = "disabled", "AUTH DISABLED (AIRA_AUTH_DISABLED=true) - /v1 is open");
         } else {
-            info!(event = "auth.init", mode = "missing", "AIRA_API_KEY not set; /v1 will reject requests");
+            info!(
+                event = "auth.init",
+                mode = "missing",
+                "AIRA_API_KEY not set; /v1 will reject requests"
+            );
         }
     } else {
         info!(event = "auth.init", mode = "api_key", "API key auth enabled for /v1");
@@ -63,7 +67,7 @@ async fn main() {
     let state = AppState {
         storage,
         api_key,
-        allow_insecure_dev,
+        auth_disabled,
     };
 
     let v1 = Router::new()
@@ -71,6 +75,7 @@ async fn main() {
             "/entities/:id",
             put(put_entity).patch(patch_entity).get(get_entity),
         )
+        .route("/entities", get(list_entities))
         .layer(middleware::from_fn_with_state(state.clone(), api_key_guard));
 
     let app = Router::new()
@@ -257,6 +262,12 @@ fn api_error_response(err: ApiError, trace_id: String) -> Response {
 #[async_trait]
 trait Storage: Send + Sync + 'static {
     async fn get(&self, id: &str) -> Result<Option<StoredEntity>, ApiError>;
+    async fn list(
+        &self,
+        entity_type: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<EntityDoc>, ApiError>;
     async fn upsert(
         &self,
         id: &str,
@@ -283,6 +294,29 @@ struct InMemoryStorage {
 impl Storage for InMemoryStorage {
     async fn get(&self, id: &str) -> Result<Option<StoredEntity>, ApiError> {
         Ok(self.map.read().unwrap().get(id).cloned())
+    }
+
+    async fn list(
+        &self,
+        entity_type: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<EntityDoc>, ApiError> {
+        let map = self.map.read().unwrap();
+        let mut items: Vec<EntityDoc> = map
+            .values()
+            .filter(|e| match entity_type {
+                Some(t) => e.doc.entity_type == t,
+                None => true,
+            })
+            .map(|e| e.doc.clone())
+            .collect();
+
+        items.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let off = offset as usize;
+        let lim = limit as usize;
+        Ok(items.into_iter().skip(off).take(lim).collect())
     }
 
     async fn upsert(
@@ -484,6 +518,42 @@ impl Storage for PostgresStorage {
             version: version as u64,
             updated_at_ms,
         }))
+    }
+
+    async fn list(
+        &self,
+        entity_type: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<EntityDoc>, ApiError> {
+        let rows = sqlx::query(
+            "SELECT doc FROM entities WHERE ($1::text IS NULL OR entity_type = $1) ORDER BY id LIMIT $2 OFFSET $3",
+        )
+        .bind(entity_type)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(
+                event = "pg.list",
+                result = "fail",
+                err = %e,
+                entityType = ?entity_type,
+                limit = limit,
+                offset = offset
+            );
+            ApiError::Internal
+        })?;
+
+        let mut out: Vec<EntityDoc> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let doc_val: JsonValue = row.try_get("doc").map_err(|_| ApiError::Internal)?;
+            let doc: EntityDoc =
+                serde_json::from_value(doc_val).map_err(|_| ApiError::InvalidJson)?;
+            out.push(doc);
+        }
+        Ok(out)
     }
 
     async fn upsert(
@@ -696,12 +766,54 @@ impl Storage for PostgresStorage {
 struct AppState {
     storage: Arc<dyn Storage>,
     api_key: Option<String>,
-    allow_insecure_dev: bool,
+    auth_disabled: bool,
 }
 
 // ----------------------------
 // Handlers
 // ----------------------------
+
+#[derive(Debug, Deserialize)]
+struct ListQuery {
+    #[serde(rename = "type")]
+    entity_type: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+async fn list_entities(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let trace_id = trace_id_from(&headers);
+
+    let limit = q.limit.unwrap_or(50).min(500);
+    let offset = q.offset.unwrap_or(0);
+    let entity_type = q.entity_type.as_deref();
+
+    match state.storage.list(entity_type, limit, offset).await {
+        Ok(items) => {
+            info!(
+                event = "entity.list",
+                result = "ok",
+                traceId = %trace_id,
+                entityType = ?entity_type,
+                limit = limit,
+                offset = offset,
+                count = items.len()
+            );
+
+            let mut resp = Json(items).into_response();
+            resp.headers_mut().insert(
+                "x-trace-id",
+                HeaderValue::from_str(&trace_id).unwrap(),
+            );
+            resp
+        }
+        Err(e) => api_error_response(e, trace_id),
+    }
+}
+
 async fn get_entity(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -846,10 +958,12 @@ async fn api_key_guard(
 ) -> Response {
     let trace_id = trace_id_from(&headers);
 
+    // If explicitly disabled, allow (even if API key is set)
+    if state.auth_disabled {
+        return next.run(req).await;
+    }
+
     let Some(expected) = state.api_key.as_deref() else {
-        if state.allow_insecure_dev {
-            return next.run(req).await;
-        }
         return api_error_response(ApiError::Unauthorized, trace_id);
     };
 
